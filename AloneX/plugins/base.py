@@ -458,7 +458,7 @@ async def start_group(client: Client, message: Message):
         asyncio.create_task(_st())
         asyncio.create_task(check_chat_exists(message.chat.id))
         asyncio.create_task(_bst_group(message.chat, message.from_user, 'start'))
-        await _sp(cid=message.chat.id, p=getattr(config, "START_IMG", None), c="👋 Hello everyone! Rosie here.\nI'm ready to manage and protect this group. Type /help to see what I can do!")
+        await _sp(cid=message.chat.id, p=getattr(config, "START_IMG", None), c="👋 Hello everyone! Toji here.\nI'm ready to manage and protect this group. Type /help to see what I can do!")
     except Exception as e:
         print(f"[START_GROUP ERROR] {e}")
 
