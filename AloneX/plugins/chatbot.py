@@ -17,6 +17,7 @@ from AloneX import pbot, prefix_cmds, font, init_aiohttp_session
 import AloneX
 from AloneX.helpers.decorator import protected_ids
 from AloneX.db.chatbot import add_chat, remove_chat, CHAT_IDS
+from AloneX.db import chatbot_stickers as stickerdb
 import config
 
 __module__ = "𝐂ʜᴀᴛ-𝐁ᴏᴛ🤖"
@@ -28,6 +29,8 @@ __help__ = """
 ❂ /chatbot on | off — Enable or disable directly.
 ❂ /chatbot auto on | off — (groups) let the bot join ongoing conversations.
 ❂ /chatbot reset — Clear the bot's short-term memory for this chat.
+❂ /savesticker — (owner) reply to a sticker to save it. Optional mood tags: /savesticker happy playful
+❂ /stickers — (owner) show how many stickers are saved.
 
 *Notes:*
 - Private chats: replies to every message once enabled (via /chatbot).
@@ -36,6 +39,7 @@ __help__ = """
 - Chats like a chill dost: short, funny, Hinglish / Hindi / English depending on you.
 - Remembers recent messages per chat so follow-ups make sense.
 - Gives longer answers only when you actually ask for an explanation.
+- Sometimes follows a reply with a sticker that matches the mood.
 - It is an AI and says so honestly if asked. Memory is short-term and kept only in RAM.
 """
 
@@ -69,6 +73,17 @@ def _env_bool(name: str, default: bool) -> bool:
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_prob(name: str, default: float) -> float:
+    """Probability clamped to 0..1 (invalid / NaN values fall back to the default)."""
+    try:
+        v = float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+    if v != v:  # NaN
+        return default
+    return min(1.0, max(0.0, v))
 
 
 # Provider (Groq, OpenAI-compatible endpoint — same as your old code)
@@ -110,6 +125,14 @@ TYPING_DELAY = _env_float("CHATBOT_TYPING_DELAY", 0.0)  # max extra "typing…" 
 ERROR_NOTICE = _env_bool("CHATBOT_ERROR_NOTICE", True)
 MAX_FLOOD_WAIT = _env_int("CHATBOT_MAX_FLOOD_WAIT", 15)
 TRIGGER_WORDS = [w.strip() for w in _env_str("CHATBOT_TRIGGER_WORDS", "").split(",") if w.strip()]
+
+# Stickers
+STICKERS_ENABLED = _env_bool("CHATBOT_STICKERS_ENABLED", True)  # sending mood stickers after replies
+STICKER_COLLECT = _env_bool("CHATBOT_STICKER_COLLECT", True)  # auto-saving stickers users send
+STICKER_CHANCE = _env_prob("CHATBOT_STICKER_CHANCE", 0.15)  # 0..1, chance per eligible reply
+STICKER_COOLDOWN = _env_float("CHATBOT_STICKER_COOLDOWN", 60.0, 0.0)  # seconds between stickers per chat
+STICKER_HISTORY = _env_int("CHATBOT_STICKER_HISTORY", 8, 1)  # last N stickers per chat that won't repeat
+STICKER_COLLECT_GROUP = 11  # pyrogram handler group of the collector (chatbot text handler uses 10)
 
 # Same owner ID as your old file; override with env var if you like.
 OWNER_ID = _env_int("CHATBOT_OWNER_ID", 8986776894)
@@ -478,7 +501,8 @@ class Turn:
 
 class Conversation:
     __slots__ = ("turns", "last_active", "lock", "user_seq", "answered",
-                 "last_bot_ts", "notice_ts", "_counter", "styles")
+                 "last_bot_ts", "notice_ts", "_counter", "styles",
+                 "last_sticker_ts", "sticker_block_until", "recent_stickers")
 
     def __init__(self, maxlen: int):
         self.turns: Deque[Turn] = deque(maxlen=maxlen)
@@ -490,6 +514,10 @@ class Conversation:
         self.notice_ts = 0.0
         self._counter = 0
         self.styles: Dict[int, StyleProfile] = {}
+        # sticker state (per chat): cooldown, temporary block after Telegram refusals, no-repeat history
+        self.last_sticker_ts = 0.0
+        self.sticker_block_until = 0.0
+        self.recent_stickers: Deque[str] = deque(maxlen=STICKER_HISTORY)
 
     def add(self, role: str, name: str, text: str) -> None:
         self.turns.append(Turn(role, name, text))
@@ -561,6 +589,7 @@ class ConversationStore:
                 conv.turns.clear()
                 conv.answered.clear()
                 conv.styles.clear()
+                conv.recent_stickers.clear()
             self._items.move_to_end(chat_id)
             return conv
         conv = Conversation(GROUP_HISTORY if is_group else DM_HISTORY)
@@ -967,6 +996,203 @@ async def _get_bot_username() -> str:
 
 
 # ════════════════════════════════════════════════════════════════════
+#  STICKERS: validation, mood detection, sending
+#  (storage lives in AloneX/db/chatbot_stickers.py)
+# ════════════════════════════════════════════════════════════════════
+def _sticker_ok(sticker) -> bool:
+    """Only real, sendable stickers (custom-emoji stickers can't be sent as stickers)."""
+    if sticker is None:
+        return False
+    if not isinstance(getattr(sticker, "file_id", None), str) or not sticker.file_id:
+        return False
+    if not isinstance(getattr(sticker, "file_unique_id", None), str) or not sticker.file_unique_id:
+        return False
+    st = getattr(sticker, "type", None)
+    if st is not None and "CUSTOM_EMOJI" in str(getattr(st, "name", st)).upper():
+        return False
+    return True
+
+
+async def _store_sticker(sticker, chat_id, user_id, moods=None, owner_saved: bool = False) -> str:
+    return await stickerdb.save_sticker(
+        file_id=sticker.file_id,
+        file_unique_id=sticker.file_unique_id,
+        emoji=getattr(sticker, "emoji", None),
+        set_name=getattr(sticker, "set_name", None),
+        chat_id=chat_id,
+        user_id=user_id,
+        moods=moods,
+        owner_saved=owner_saved,
+        is_animated=bool(getattr(sticker, "is_animated", False)),
+        is_video=bool(getattr(sticker, "is_video", False)),
+    )
+
+
+# -- mood detection (cheap keyword/emoji heuristics, no extra API call) --
+_SEVERE_RE = re.compile(
+    r"\b(?:suicid\w*|kill\s?myself|end\s?my\s?life|self[\s-]?harm|want\s?to\s?die|wanna\s?die|"
+    r"marna\s?chah\w*|mar\s?jau\w*|mar\s?jana|khud\s?ko\s?khatam|aatmahatya|rape\w*|molest\w*|"
+    r"abus(?:e|ed|ive)|cancer|died|passed\s?away|funeral|death|accident|hospital|icu|ambulance|"
+    r"miscarriage|panic\s?attack|depress\w*)\b",
+    re.I,
+)
+_SEVERE_DEVA_RE = re.compile("आत्महत्या|मरना\\s?चाह|मर\\s?जा|मौत|निधन|बलात्कार")
+
+_MOOD_PATTERNS = {
+    "sad": re.compile(
+        r"\b(?:sad|dukhi|udas|ro\s?rha|ro\s?raha|ro\s?rahi|rona|roya|cry\w*|breakup|break\s?up|akela|akeli|"
+        r"lonely|dard|dil\s?toot\w*|toot\s?gya|bura\s?lag\w*|dukh|miss\s?(?:u|you|him|her)|hurt)\b", re.I),
+    "angry": re.compile(
+        r"\b(?:angry|gussa|gusse|naraz|irritat\w*|bakwas|hate|nafrat|shut\s?up|stupid|idiot|bewakoof|gali|"
+        r"chutiya|madarchod|bhosdi\w*|mc|bc|fuck\w*)\b", re.I),
+    "excited": re.compile(
+        r"\b(?:omg|wow|yay|congrat\w*|badhai|mubarak|party|let'?s\s?go|zabardast|amazing|awesome|lit|fire|"
+        r"selected|won|jeet\w*|setting\s?ho\s?gyi)\b|!{2,}", re.I),
+    "happy": re.compile(
+        r"\b(?:happy|khush|khushi|maza|mazaa|mast|nice|great|badhiya|sahi|thanks|thank\s?you|shukriya|good|cool)\b",
+        re.I),
+    "confused": re.compile(
+        r"\b(?:confus\w*|samajh\w*\s?(?:nhi|nahi)|samjh\w*\s?(?:nhi|nahi)|pata\s?(?:nhi|nahi)|idk|huh|"
+        r"matlab\s?kya|wtf)\b", re.I),
+    "playful": re.compile(
+        r"\b(?:lol|lmao|lmfao|haha\w*|hehe\w*|rofl|joke|mazak|mazaak|bakchod\w*|roast|dramebaaz|funny|nautanki)\b",
+        re.I),
+    "affectionate": re.compile(
+        r"\b(?:love\s?(?:you|u)|luv|pyar|pyaar|jaan|baby|babu|shona|sweetheart|hug|kiss|crush|gf|girlfriend)\b",
+        re.I),
+    "supportive": re.compile(
+        r"\b(?:don'?t\s?worry|tension\s?mat|fikar|sab\s?theek|theek\s?ho\s?jayega|himmat|take\s?care|"
+        r"dhyan\s?rakh\w*|worried|worry|pareshan\w*|stress\w*|anxious|exam|interview|fail\w*|help)\b", re.I),
+}
+# tie-break order when two moods score the same
+_MOOD_PRIORITY = ("sad", "angry", "supportive", "confused", "excited", "affectionate", "playful", "happy", "neutral")
+
+# conversation mood -> sticker moods to look for (best first). Anything missing falls back to "skip".
+_STICKER_TARGETS = {
+    "happy": ("happy", "playful"),
+    "excited": ("excited", "happy"),
+    "sad": ("supportive", "affectionate"),  # never joke back at sadness: comforting stickers only
+    "confused": ("confused",),
+    "playful": ("playful", "happy"),
+    "affectionate": ("affectionate", "happy"),
+    "supportive": ("supportive", "affectionate"),
+    "neutral": ("neutral",),
+}
+# lower chance for moods where a sticker is less natural
+_STICKER_CHANCE_FACTOR = {"neutral": 0.5, "sad": 0.7, "supportive": 0.7}
+
+
+def _detect_mood(conv: Conversation, user_text: str, reply: str):
+    """
+    Returns (mood, severe).
+    Looks at the latest user message (weight 2), the bot's own reply (its emoji weigh most, since the sticker
+    should match the bot's tone) and earlier turns of the conversation (weight 1).
+    `severe` = conversation touches serious topics (self-harm, death, abuse, ...): never send a sticker.
+    """
+    turns = list(conv.turns)
+    recent_text = " ".join(t.text for t in turns[-6:]) + " " + user_text + " " + reply
+    if _SEVERE_RE.search(recent_text) or _SEVERE_DEVA_RE.search(recent_text):
+        return "neutral", True
+
+    context = " ".join(t.text for t in (turns[:-2][-4:] if len(turns) > 2 else []))
+    ut, rt, ct = user_text.lower(), reply.lower(), context.lower()
+
+    scores = {m: 0 for m in _MOOD_PRIORITY}
+    for mood, rx in _MOOD_PATTERNS.items():
+        scores[mood] += 2 * min(2, len(rx.findall(ut)))
+        scores[mood] += min(2, len(rx.findall(rt)))
+        scores[mood] += min(2, len(rx.findall(ct))) // 2
+    for m in stickerdb.moods_from_emoji(user_text):
+        scores[m] += 1
+    for m in stickerdb.moods_from_emoji(reply):
+        scores[m] += 2
+    words = user_text.split()
+    if user_text.rstrip().endswith("?") and 0 < len(words) <= 3:
+        scores["confused"] += 2  # short follow-ups like "kyu?" / "fir?"
+
+    best = max(_MOOD_PRIORITY, key=lambda m: (scores[m], -_MOOD_PRIORITY.index(m)))
+    if scores[best] <= 0:
+        return "neutral", False
+    return best, False
+
+
+def _sticker_targets(mood: str, reply: str):
+    if mood == "angry":
+        # never answer an angry user with an angry sticker, unless our own reply is playfully annoyed
+        return ("angry",) if "angry" in stickerdb.moods_from_emoji(reply) else ()
+    return _STICKER_TARGETS.get(mood, ())
+
+
+_BAD_FILE_CODES = {"FILE_ID_INVALID", "DOCUMENT_INVALID", "STICKER_ID_INVALID", "MEDIA_EMPTY"}
+
+
+async def _send_sticker(message: Message, doc: dict, conv: Conversation) -> bool:
+    """Send a stored sticker by file_id. Never raises (except cancellation); returns True when sent."""
+    try:
+        await message.reply_sticker(doc["file_id"])
+        return True
+    except asyncio.CancelledError:
+        raise
+    except FloodWait as e:
+        wait = _flood_seconds(e)
+        log.warning("FloodWait %ss on sticker, skipping", wait)
+        conv.sticker_block_until = time.monotonic() + min(max(wait, 30), 600)
+    except RPCError as e:
+        code = str(getattr(e, "ID", "") or "")
+        if code in _BAD_FILE_CODES:
+            log.warning("Invalid sticker file_id (%s), removing it", code)
+            await stickerdb.remove_sticker(doc.get("file_unique_id"))
+        elif "FORBIDDEN" in code or "RESTRICTED" in code:
+            conv.sticker_block_until = time.monotonic() + 3600  # stickers not allowed in this chat
+            log.info("Stickers not allowed here (%s), pausing for an hour", code)
+        else:
+            log.warning("Sticker send failed: %s %s", type(e).__name__, code)
+    except (ValueError, KeyError, TypeError) as e:
+        log.warning("Stored sticker unusable (%s), removing it", type(e).__name__)
+        await stickerdb.remove_sticker(doc.get("file_unique_id") if isinstance(doc, dict) else None)
+    except Exception as e:
+        log.warning("Sticker send error: %s", type(e).__name__)
+    return False
+
+
+async def _maybe_send_sticker(message: Message, conv: Conversation, user_id: int, seq: int,
+                              user_text: str, reply: str) -> None:
+    """Called only after the text reply was sent. Any failure here is logged and ignored."""
+    try:
+        if not STICKERS_ENABLED or STICKER_CHANCE <= 0 or not reply or _is_skip(reply):
+            return
+        now = time.monotonic()
+        if now < conv.sticker_block_until:
+            return
+        if conv.last_sticker_ts and now - conv.last_sticker_ts < STICKER_COOLDOWN:
+            return
+        if not conv.is_latest(user_id, seq):
+            return
+
+        mood, severe = _detect_mood(conv, user_text, reply)
+        if severe:
+            return
+        targets = _sticker_targets(mood, reply)
+        if not targets:
+            return
+        if random.random() >= STICKER_CHANCE * _STICKER_CHANCE_FACTOR.get(mood, 1.0):
+            return
+
+        doc = await stickerdb.get_sticker_for_moods(targets, exclude=list(conv.recent_stickers))
+        if not doc or not doc.get("file_id"):
+            return
+        if not conv.is_latest(user_id, seq):  # user wrote again while we were fetching
+            return
+        if await _send_sticker(message, doc, conv):
+            conv.last_sticker_ts = time.monotonic()
+            conv.recent_stickers.append(doc.get("file_unique_id") or "")
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("sticker reply error")
+
+
+# ════════════════════════════════════════════════════════════════════
 #  ADMIN / SETTINGS UI  (behaviour preserved from your old file)
 # ════════════════════════════════════════════════════════════════════
 async def is_user_admin(chat_id: int, user_id: int):
@@ -1116,6 +1342,111 @@ async def chatbot_auto_callback(_, query: CallbackQuery):
     AUTO_OVERRIDES[chat_id] = not _auto_enabled(chat_id)
     await _refresh_panel(query, chat_id, _is_group_chat(query.message.chat))
     await query.answer(font(f"Auto-chat {'On' if AUTO_OVERRIDES[chat_id] else 'Off'}"))
+
+
+# ════════════════════════════════════════════════════════════════════
+#  STICKER COLLECTION + OWNER COMMANDS
+# ════════════════════════════════════════════════════════════════════
+async def _collect_sticker(message: Message) -> None:
+    chat = message.chat
+    sticker = message.sticker
+    if chat is None or sticker is None:
+        return
+    if not (chat.type == enums.ChatType.PRIVATE or _is_group_chat(chat)):
+        return
+    user = message.from_user
+    if user is not None and (user.is_bot or getattr(user, "is_self", False)):
+        return  # never collect bot-generated stickers (prevents loops)
+    if not _sticker_ok(sticker):
+        return
+    result = await _store_sticker(sticker, chat.id, user.id if user else None)
+    if result == stickerdb.SAVED:
+        log.debug("new sticker collected")
+    elif result == stickerdb.ERROR:
+        log.warning("sticker could not be stored")
+
+
+@pbot.on_message(
+    filters.sticker
+    & filters.incoming
+    & ~filters.bot
+    & ~filters.via_bot,
+    group=STICKER_COLLECT_GROUP
+)
+async def sticker_collector(_, message: Message):
+    """Separate from the chatbot handler: works in every chat, even when /chatbot is disabled."""
+    if not STICKER_COLLECT:
+        return
+    try:
+        await _collect_sticker(message)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("sticker collector error")
+
+
+@pbot.on_message(filters.command("savesticker", prefixes=prefix_cmds))
+async def savesticker_cmd(_, message: Message):
+    user = message.from_user
+    if not user:
+        return
+    if user.id != OWNER_ID:
+        return await message.reply_text(font("❌ Only the bot owner can use this command."))
+
+    rt = message.reply_to_message
+    sticker = rt.sticker if rt is not None else None
+    if sticker is None or not _sticker_ok(sticker):
+        return await message.reply_text(
+            font("Reply to a sticker with /savesticker to save it.\n"
+                 "Optional mood tags: /savesticker happy playful\n"
+                 "Moods: " + ", ".join(stickerdb.MOODS))
+        )
+
+    args = [a.lower() for a in (message.command or [])[1:]]
+    tags = stickerdb.normalize_moods(args)
+    ignored = [a for a in args if a not in stickerdb.MOODS]
+    try:
+        result = await _store_sticker(
+            sticker, message.chat.id, rt.from_user.id if rt.from_user else None,
+            moods=tags, owner_saved=True,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("savesticker failed")
+        return await message.reply_text(font("❌ Couldn't save the sticker, try again."))
+
+    if result == stickerdb.SAVED:
+        text = "✅ Sticker saved."
+    elif result == stickerdb.EXISTS:
+        text = "ℹ️ This sticker was already saved." + (" Mood tags updated." if tags else "")
+    else:
+        text = "❌ Couldn't save the sticker, try again."
+    if tags and result in (stickerdb.SAVED, stickerdb.EXISTS):
+        text += "\nMoods added: " + ", ".join(tags)
+    if ignored:
+        text += "\nIgnored unknown moods: " + ", ".join(ignored)
+    await message.reply_text(font(text))
+
+
+@pbot.on_message(filters.command("stickers", prefixes=prefix_cmds))
+async def stickers_stats_cmd(_, message: Message):
+    user = message.from_user
+    if not user or user.id != OWNER_ID:
+        return  # statistics are owner-only; stay silent for everyone else
+    try:
+        total = await stickerdb.count_stickers()
+        by_mood = await stickerdb.count_by_mood()
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("stickers stats failed")
+        return await message.reply_text(font("❌ Couldn't read sticker stats."))
+    lines = [f"🎴 Saved stickers: {total}"]
+    if by_mood:
+        lines.append("")
+        lines.extend(f"{m}: {by_mood.get(m, 0)}" for m in stickerdb.MOODS if by_mood.get(m))
+    await message.reply_text(font("\n".join(lines)))
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -1271,6 +1602,11 @@ async def _process(message: Message):
         conv.add("assistant", "bot", _clip(reply, MAX_TURN_CHARS))
         conv.last_bot_ts = time.monotonic()
         conv.mark_answered(user.id)
+
+        # Optional mood sticker: only after the text went out, only when directly addressed, never for
+        # long explanations. Errors inside are logged and swallowed, so the text reply is never affected.
+        if addressed and not detail:
+            await _maybe_send_sticker(message, conv, user.id, seq, text, reply)
 
 
 @pbot.on_message(
