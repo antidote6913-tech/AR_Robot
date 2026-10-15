@@ -5,7 +5,8 @@ Long-term memory for the chatbot (MongoDB, async / Motor style).
 
 * `chatbot_profiles` collection: one document per person (and scope, see chatbot.py):
   who they are (name, facts), a running summary of earlier chats, where the last
-  conversation stopped (`recent`, `last_topic`, `last_seen_at`) and a few flags.
+  conversation stopped (`recent`, `last_topic`, `last_seen_at`), things they still
+  have to report back on (`open_loops`, `left_note`) and a few flags.
 * Raw message history is NOT stored here: it lives in `chatbot_memory`
   (AloneX/db/chatbot.py: save_message / get_history). This module only adds
   pruning / wiping helpers for that collection.
@@ -24,7 +25,7 @@ log = logging.getLogger("AloneX.chatbot.profiles")
 
 profile_collection = database["chatbot_profiles"]
 
-_ALLOWED_FLAGS = ("gender", "flirt_off", "minor_hint")
+_ALLOWED_FLAGS = ("gender", "flirt_off", "minor_hint", "left_note", "left_at")
 _indexes_ready = False
 
 
@@ -105,14 +106,22 @@ async def record_exchange(
         return False
 
 
-async def save_memory(key: str, summary: str, facts: Sequence[str], last_topic: str = "") -> bool:
-    """Store the refreshed long-term notes (summary, facts, last topic)."""
+async def save_memory(
+    key: str,
+    summary: str,
+    facts: Sequence[str],
+    last_topic: str = "",
+    open_loops: Optional[Sequence[str]] = None,
+) -> bool:
+    """Store the refreshed long-term notes (summary, facts, last topic, things the person still has to report back on)."""
     fields = {
         "summary": _clip(summary or "", 900),
         "facts": [_clip(f, 140) for f in list(facts)[:30] if str(f).strip()],
         "last_topic": _clip(last_topic or "", 140),
         "memory_updated_at": _now(),
     }
+    if open_loops is not None:
+        fields["open_loops"] = [_clip(x, 140) for x in list(open_loops)[:10] if str(x).strip()]
     try:
         await profile_collection.update_one({"_id": str(key)}, {"$set": fields}, upsert=False)
         return True
@@ -124,7 +133,7 @@ async def save_memory(key: str, summary: str, facts: Sequence[str], last_topic: 
 
 
 async def set_flags(key: str, user_id: int, **flags) -> bool:
-    """Persist gender / flirt_off / minor_hint (only these fields are accepted)."""
+    """Persist gender / flirt_off / minor_hint / left_note / left_at (only these fields are accepted; None clears)."""
     fields = {k: v for k, v in flags.items() if k in _ALLOWED_FLAGS}
     if not fields:
         return False
