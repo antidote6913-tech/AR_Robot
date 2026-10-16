@@ -15,6 +15,7 @@ Uses the same connection as AloneX/db/chatbot.py (`AloneX.database2`).
 """
 import asyncio
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence
 
@@ -204,3 +205,29 @@ async def prune_history(chat_id: int, user_id: int, keep: int = 400) -> int:
     except Exception as e:
         log.error("Error pruning history: %s", type(e).__name__)
         return 0
+
+
+async def search_history(chat_id: int, user_id: int, words: Sequence[str], limit: int = 4) -> List[dict]:
+    """
+    Older messages this person sent that mention any of `words` (newest first).
+    Lets the bot remember things from long ago, not only from the last few messages.
+    Returns [{"content": str, "timestamp": datetime or None}, ...].
+    """
+    words = [w for w in (str(x).strip() for x in words) if len(w) >= 3][:4]
+    if not words:
+        return []
+    query = {
+        "chat_id": int(chat_id),
+        "user_id": int(user_id),
+        "role": "user",
+        "content": {"$regex": "|".join(re.escape(w) for w in words), "$options": "i"},
+    }
+    try:
+        n = int(limit) + 6  # a few extra: the caller drops messages that are still in the recent context
+        docs = await memory_collection.find(query, {"content": 1, "timestamp": 1}).sort("_id", -1).limit(n).to_list(length=n)
+        return [{"content": str(d.get("content") or ""), "timestamp": d.get("timestamp")} for d in docs]
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("Error searching history: %s", type(e).__name__)
+        return []
