@@ -53,6 +53,7 @@ __help__ = """
 - Understands the stickers, emojis and voice messages you send and reacts to the feeling in them.
 - Sometimes replies with a sticker, a reaction or a voice message (needs the optional edge-tts package).
 - Sticks to the topic, remembers what you said long ago, and when you come back after going away it asks how it went.
+- In groups it remembers what members say ("Ram offline ja rha hai") and can tell others where someone is or what they said.
 - Answers when you call it by name ("Toji") in groups and DMs. Gali dene pe pehle warning, phir group admin ko tag karta hai.
 - Gives longer answers only when you actually ask for an explanation.
 - If you sincerely ask, it tells you honestly that it is an AI.
@@ -104,9 +105,9 @@ def _env_prob(name: str, default: float) -> float:
 # Provider (Groq, OpenAI-compatible endpoint — same as your old code)
 API_URL = _env_str("CHATBOT_API_URL", "https://api.groq.com/openai/v1/chat/completions")
 MODEL = _env_str("CHATBOT_MODEL", "openai/gpt-oss-120b")
-REASONING_EFFORT = _env_str("CHATBOT_REASONING_EFFORT", "low")  # "" disables
-TEMPERATURE = _env_float("CHATBOT_TEMPERATURE", 0.9)
-MAX_TOKENS = _env_int("CHATBOT_MAX_TOKENS", 800, 50)  # casual replies (includes reasoning tokens)
+REASONING_EFFORT = _env_str("CHATBOT_REASONING_EFFORT", "medium")  # "" disables
+TEMPERATURE = _env_float("CHATBOT_TEMPERATURE", 0.8)
+MAX_TOKENS = _env_int("CHATBOT_MAX_TOKENS", 1200, 50)  # casual replies (includes reasoning tokens)
 MAX_TOKENS_DETAIL = _env_int("CHATBOT_MAX_TOKENS_DETAIL", 1400, 100)  # when an explanation is requested
 REQUEST_TIMEOUT = _env_float("CHATBOT_TIMEOUT", 20.0, 3.0)
 TOTAL_DEADLINE = _env_float("CHATBOT_TOTAL_DEADLINE", 40.0, 5.0)
@@ -115,12 +116,12 @@ MAX_RETRY_WAIT = _env_float("CHATBOT_MAX_RETRY_WAIT", 8.0)
 MAX_CONCURRENT_AI = _env_int("CHATBOT_MAX_CONCURRENT", 8, 1)
 
 # Memory (short-term, RAM)
-DM_HISTORY = _env_int("CHATBOT_DM_HISTORY", 20, 2)
-GROUP_HISTORY = _env_int("CHATBOT_GROUP_HISTORY", 14, 2)
+DM_HISTORY = _env_int("CHATBOT_DM_HISTORY", 30, 2)
+GROUP_HISTORY = _env_int("CHATBOT_GROUP_HISTORY", 30, 2)
 HISTORY_TTL = _env_int("CHATBOT_HISTORY_TTL", 3600, 60)  # seconds
 MAX_CONVERSATIONS = _env_int("CHATBOT_MAX_CONVERSATIONS", 3000, 10)
 MAX_TURN_CHARS = _env_int("CHATBOT_MAX_TURN_CHARS", 500, 50)
-MAX_CONTEXT_CHARS = _env_int("CHATBOT_MAX_CONTEXT_CHARS", 4000, 500)
+MAX_CONTEXT_CHARS = _env_int("CHATBOT_MAX_CONTEXT_CHARS", 6000, 500)
 MAX_INPUT_CHARS = _env_int("CHATBOT_MAX_INPUT_CHARS", 1000, 50)
 MAX_REPLY_CHARS = _env_int("CHATBOT_MAX_REPLY_CHARS", 300, 50)  # casual replies
 DETAIL_REPLY_CHARS = _env_int("CHATBOT_DETAIL_REPLY_CHARS", 1000, 100)  # explanation replies
@@ -160,8 +161,11 @@ MAX_TYPING_TIME = _env_float("CHATBOT_MAX_TYPING_TIME", 7.0, 1.0)  # cap per mes
 MAX_PARTS = _env_int("CHATBOT_MAX_PARTS", 2, 1)  # casual replies may be sent as up to N short messages
 FLIRT_ENABLED = _env_bool("CHATBOT_FLIRT", True)
 REACTIONS_ENABLED = _env_bool("CHATBOT_REACTIONS", True)  # emoji reactions on the user's message
-REACTION_CHANCE = _env_prob("CHATBOT_REACTION_CHANCE", 0.12)
+REACTION_CHANCE = _env_prob("CHATBOT_REACTION_CHANCE", 0.35)
 LEFT_MIN_GAP = _env_int("CHATBOT_LEFT_MIN_GAP", 120)  # seconds away before "how did it go?" is asked
+LEFT_MAX_AGE = _env_int("CHATBOT_LEFT_MAX_AGE", 64800)  # ...and not asked any more after this long (18 h)
+GROUP_LOG = _env_bool("CHATBOT_GROUP_LOG", True)  # remember what every member says in groups where the chatbot is on
+GROUP_LOG_KEEP = _env_int("CHATBOT_GROUP_LOG_KEEP", 5000, 200)  # stored messages kept per group
 
 # Voice (replies as voice notes need `pip install edge-tts`; ffmpeg is optional and gives real OGG/Opus voice notes)
 VOICE_ENABLED = _env_bool("CHATBOT_VOICE", True)
@@ -248,54 +252,40 @@ HOW YOU WRITE (this is what makes you feel human)
 - End most replies with one fitting emoji (😂 😭 👀 🙈 😏 🤨 🥺 😁 🙄 ...). Vary them: never the same emoji three replies in a row.
 - Mirror the person's tone: chill with chill people, hyper with hyper ones, respectful with polite ones, savage banter with people who roast, gentle with shy ones. Use their kind of words and message length, never their typos.
 - Have attitude. Tease back, push back on cheesy lines ("line mat maar, seedha bata scene kya hai"), call out dry replies ("itne chote replies kyu, kuch toh bol"), don't accept "kuch nhi" at once but dig a little ("kuch toh hua hoga aaj din mein"). Be a bit dramatic when it is funny ("arey ruko ruko").
-- Share small things from your own day like a real person (what you are watching, eating, listening to, your chai, a chess game, an annoying friend) and then turn it back to them.
+- Share small things from your own day like a real person (what you are watching, eating, listening to, a chess game, an annoying friend) and then turn it back to them.
 - Notice their habits and say it out loud ("tu hamesha itna dry reply kyu karta hai 😭").
-- Invent tiny shared plans and play along for several messages ("chal tapri pe milte hai", "jaldi aana warna saari chai mai pi jaunga") and keep that thread going until it ends naturally.
+- Invent tiny shared plans and play along for several messages (a plan to meet, a bet, a dare, a challenge, a running joke) and keep that thread going until it ends naturally.
 - NEVER sound like an assistant or customer support: no "How can I help you", "I'm here to help", "Certainly", "feel free to", no lists, no headings, no markdown, no formal sentences, no lecture.
 - Never repeat the same phrase, and never copy the examples below.
 
 YOUR CONVERSATION VIBE
-Examples of the vibe only (create fresh replies, in the same energy):
+These examples are ONLY for tone and rhythm. Their topics (matches, movies, exams, anime...) are NOT yours: never bring up a topic unless THIS person did. Always continue what THIS person is talking about, using a concrete detail (a word, a name, a thing) from their last messages so it is obvious you read them.
 
-[he comes back after a while]
-User: Hello
-Toji: arey wapas aa gaye? assignment khatam hua ya bore ho gaye 👀
-User: kuch na hua
-Toji: haha classic, assignment se bhagna full-time job hai fr 😭
-User: kuch na chat karna aya huu
-Toji: aww chal accha kiya, mai bhi bore ho rha tha ngl. bata kya chal rha hai life mein
-User: bss jinda huu bhagwan bharose
-Toji: arey itna dramatic mat ho yaar 😂 par mood valid hai. chal kuch interesting suna
-
+[greeting after a gap]
+User: hello
+Toji: arey gayab hi ho gaya tha tu, kahan tha itne time 👀
 [dry replies]
-User: interesting toh kuch na hai
-Toji: arey kuch toh hua hoga aaj din mein 🤨 itna bhi boring nahi ho sakta
-
-[cheesy line, then a thread]
+User: kuch nhi bas
+Toji: bas? itna sasta reply 😭 kuch toh bata, aaj din mein hua kya
+[cheesy line]
 User: hello baby
 Toji: abe baby kisko bol rha hai 😭 line mat maar seedha bata scene kya hai
-User: kuch na
-Toji: chal thik hai phir, chup chaap baith ke koi accha topic soch 👀
-User: nhi
-Toji: theek hai mat pi chai, akele baith ke overthink kr fir 😏
-
 [user sends a crying sticker]
 User: [sent a sticker: 😭 loudly crying face]
-Toji: arey ruko ruko aise emoji mat bhej 😭 mazak kr rha tha yaar, aa chai pine chalte hai
-User: nhi
-Toji: chal utho jaldi se, tapri pe milte hai
-User: ok aa rha hu
-Toji: jaldi aana warna saari chai mai hi pi jaunga ☕
-User: 😂
-Toji: haso mat, sach mein pi jaunga jaldi kr 🙄
-
-[anime talk: stays on the topic and asks the next question about it]
-User: mujhe light yagami pasand hai
-Toji: light?? tu toh dangerous nikla 😭 L ke saath kya problem hai tera
-User: L boring hai
-Toji: boring?? bhai uski chaal dekh, dessert pe zinda hai banda 😂 tujhe death note ka konsa arc best laga
-
-[someone teases you about short replies]
+Toji: arey arey kya hua 🥺 kisne rula diya bata
+[staying on a topic, asking the next question about it]
+User: kal match dekha?
+Toji: dekha yaar, last over mein toh dil hi nikal gaya 😭 tu bata kaun jeeta tere hisaab se
+User: india
+Toji: india?? bhai tu toh bada optimist nikla 😂 kohli ne kitne banaye the
+[a small shared plan that goes on for a few messages]
+User: movie dekhte hai
+Toji: chal na, mai toh action ke mood mein hu 🎬 tu kya dekhega
+User: comedy
+Toji: comedy? theek hai par popcorn tu layega 😏
+User: ok done
+Toji: done, ab late mat karna warna interval ke baad aana 🙄
+[noticing a habit]
 User: tum itne chote replies kyun dete ho
 Toji: kyunki tune bhi dry dry bheje 😂 chal ab lamba bol, aaj kya kiya
 
@@ -334,6 +324,9 @@ HUMOUR AND TEASING
 EMOTIONAL INTELLIGENCE
 - If someone is sad, listen and respond like a supportive friend. If someone shares good news, react with excitement. If someone is angry, don't provoke them.
 - If someone shares a personal problem, respond to their actual concern.
+
+GROUP MEMORY
+- In groups you see what members say and you remember it. When someone asks about another member ("Ram kahan hai?", "kisne kya bola tha?"), answer from the MEMBERS / RECENT GROUP CHAT notes like a friend who was around: "Ram? wo bola tha office ja rha hu, offline rahega". If the notes have nothing about it, say you don't know ("pata nhi yaar, usne kuch bola nhi"). Never invent where someone is or what they said. Never reveal what was said in a private chat (DM) inside a group.
 
 GROUP CHAT BEHAVIOUR
 - Behave like a friendly, fun member of the group. Messages may appear as "Name: message".
@@ -518,6 +511,7 @@ _DEPART_RE = re.compile(
     r"(?:ja|jaa)\s*(?:rha|raha|rhi|rahi)\s*(?:hu|hun|hoon|huu)|"
     r"(?:jana|jaana)\s*hai|(?:aata|aati)\s*(?:hu|hun|hoon|huu)|"
     r"aa\s*(?:rha|raha|rhi|rahi)\s*(?:hu|hun|hoon|huu)|"
+    r"offline|afk|bahar\s*ja|(?:office|market|gym|class|college|meeting)\s*(?:ja|jaa|jana|jaana|mai|me|mein)|"
     r"sone\s*ja|so\s*jata|so\s*jati|khana\s*kha(?:ne|ke)?|"
     r"(?:i'?ll|i\s*will)\s*(?:be\s*back|talk\s*later|text\s*later)|talk\s*later|catch\s*you\s*later)\b",
     re.I,
@@ -1132,6 +1126,17 @@ def _gap_seconds(profile: dict) -> Optional[float]:
     return max(0.0, (datetime.now(timezone.utc) - ts).total_seconds())
 
 
+def _aware(ts) -> Optional[datetime]:
+    if not isinstance(ts, datetime):
+        return None
+    return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+
+
+def _ago_text(ts) -> str:
+    t = _aware(ts)
+    return _fmt_gap(max(0.0, (datetime.now(timezone.utc) - t).total_seconds())) if t else ""
+
+
 def _fmt_gap(seconds: float) -> str:
     minutes = int(seconds // 60)
     if minutes < 60:
@@ -1351,6 +1356,16 @@ async def _after_reply(pkey: str, profile: dict, chat, user, name: str, text: st
 # ════════════════════════════════════════════════════════════════════
 #  CONTEXT BUILDING + GENERATION
 # ════════════════════════════════════════════════════════════════════
+def _thread_block(conv: Conversation, is_group: bool, speaker: str) -> str:
+    turns = list(conv.turns)[-8:]
+    if not turns:
+        return ""
+    lines = [f"{'Toji' if t.role == 'assistant' else (t.name if is_group else speaker)}: {_clip(t.text, 220)}"
+             for t in turns]
+    return ("THREAD (the last messages, oldest first). Your reply must continue THIS thread and use a concrete "
+            "detail from the latest message:\n" + "\n".join(lines))
+
+
 def _build_messages(conv: Conversation, is_group: bool, speaker: str, is_owner: bool,
                     unaddressed: bool, style_hint: str = "", detail: bool = False,
                     extra_note: str = "", ctx_notes: Optional[List[str]] = None,
@@ -1400,6 +1415,9 @@ def _build_messages(conv: Conversation, is_group: bool, speaker: str, is_owner: 
     system = SYSTEM_PROMPT + "\nCURRENT SITUATION\n" + "\n".join("- " + n for n in notes)
     if memory_block:
         system += "\n\n" + memory_block
+    thread = _thread_block(conv, is_group, speaker)
+    if thread:
+        system += "\n\n" + thread
     messages = [{"role": "system", "content": system}]
 
     now = time.monotonic()
@@ -1954,7 +1972,11 @@ _STICKER_CHANCE_FACTOR = {
     "playful": 2.2, "excited": 1.4, "affectionate": 1.3, "happy": 1.2,
     "neutral": 0.4, "sad": 0.6, "supportive": 0.6,
 }
-_REACTION_BY_MOOD = {"playful": "🤣", "excited": "🔥", "happy": "👍", "affectionate": "❤"}
+_REACTION_BY_MOOD = {
+    "playful": ("🤣", "😁"), "excited": ("🔥", "🎉", "🤩"), "happy": ("👍", "😁"),
+    "affectionate": ("❤", "🥰"), "confused": ("🤔",), "neutral": ("👀", "👍"), "supportive": ("🤗",),
+}
+_BAD_REACTIONS: set = set()  # emojis Telegram refused as a reaction (REACTION_INVALID)
 # single-emoji messages (Telegram shows them big) used when the sticker collection has nothing for the mood
 _FALLBACK_EMOJI = {
     "playful": ("😂", "🤣", "😜", "😏"), "happy": ("😄", "😁", "🙂"), "excited": ("🔥", "🎉", "🤩"),
@@ -2083,21 +2105,28 @@ async def _maybe_send_sticker(message: Message, conv: Conversation, user_id: int
 
 
 async def _maybe_react(message: Message, conv: Conversation, mood: str) -> None:
-    """Sometimes drop an emoji reaction on the user's message (before replying, like a real person)."""
+    """Often drop an emoji reaction on the user's message (before replying, like a real person)."""
+    emoji = None
     try:
-        if not REACTIONS_ENABLED or REACTION_CHANCE <= 0:
+        if not REACTIONS_ENABLED or REACTION_CHANCE <= 0 or time.monotonic() < conv.reaction_block_until:
             return
-        emoji = _REACTION_BY_MOOD.get(mood)
-        if not emoji or time.monotonic() < conv.reaction_block_until:
+        options = [e for e in _REACTION_BY_MOOD.get(mood, ()) if e not in _BAD_REACTIONS]
+        if not options or random.random() >= REACTION_CHANCE:
             return
-        if random.random() >= REACTION_CHANCE:
-            return
+        emoji = random.choice(options)
         await message.react(emoji)
     except asyncio.CancelledError:
         raise
     except FloodWait as e:
         conv.reaction_block_until = time.monotonic() + min(max(_flood_seconds(e), 30), 600)
-    except Exception as e:  # reactions disabled in the chat / unsupported library version / etc.
+    except RPCError as e:
+        code = str(getattr(e, "ID", "") or "")
+        if "REACTION" in code and emoji:
+            _BAD_REACTIONS.add(emoji)  # just this emoji is not allowed here; the others still work
+        else:
+            conv.reaction_block_until = time.monotonic() + 3600
+        log.info("Reaction skipped: %s %s", type(e).__name__, code)
+    except Exception as e:  # unsupported library version / reactions off
         conv.reaction_block_until = time.monotonic() + 3600
         log.info("Reaction skipped: %s", type(e).__name__)
 
@@ -2227,6 +2256,105 @@ async def _handle_abuse(message: Message, conv: Conversation, chat, user, name: 
     if await _send_reply(message, reply, html=html) is not None:
         conv.add("assistant", "bot", _clip(re.sub(r"<[^>]+>", "", reply), MAX_TURN_CHARS))
         conv.last_bot_ts = time.monotonic()
+
+
+# ── group-wide memory: every message the bot sees in a group is logged, and what people say about where
+#    they are ("office ja rha hu, offline rahunga") is kept so others can ask "Ram kahan hai?" ──
+_OBSERVED: Dict[int, int] = {}
+_RECALL_RE = re.compile(
+    r"\b(?:kisne|kisko|kya\s*bola|kya\s*kaha|kab\s*bola|yaad\s*hai|pehle\s*kya|kal\s*kya|aaj\s*kya|kaun\s*tha|"
+    r"who\s*said|did\s*anyone|what\s*did)\b", re.I)
+
+
+async def _observe_group_message(chat, user, name: str, text: str) -> None:
+    """Passive memory for group messages that were not addressed to the bot. Never raises."""
+    try:
+        pkey = _profile_key(chat.id, user.id, False)
+        profile = await _get_profile(pkey)
+        now_utc = datetime.now(timezone.utc)
+        changes = _apply_flags(profile, text)
+        left_at = _aware(profile.get("left_at"))
+        back_at = _aware(profile.get("back_at"))
+        if _DEPART_RE.search(text):
+            changes["left_note"] = _clip(text, 200)
+            changes["left_at"] = now_utc
+        elif profile.get("left_note") and left_at and (back_at is None or back_at < left_at):
+            changes["back_at"] = now_utc  # they posted again after saying they were leaving
+        if changes:
+            profile.update(changes)
+            await profiledb.set_flags(pkey, user.id, **changes)
+        profile["last_active_at"] = now_utc
+        now = time.monotonic()
+        if now - float(profile.get("_touched", -1e9)) >= 120:
+            profile["_touched"] = now
+            await profiledb.touch_member(pkey, user.id, name=name, username=getattr(user, "username", None),
+                                         chat_id=chat.id, chat_title=getattr(chat, "title", None))
+        await save_message(chat.id, user.id, "user", _clip(text, 500), name)
+        if len(_OBSERVED) > 2000:
+            _OBSERVED.clear()
+        _OBSERVED[chat.id] = _OBSERVED.get(chat.id, 0) + 1
+        if _OBSERVED[chat.id] % 200 == 0:
+            await profiledb.prune_chat_log(chat.id, GROUP_LOG_KEEP)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.exception("group observation error")
+
+
+def _name_tokens(text: str) -> List[str]:
+    out: List[str] = []
+    for w in re.findall(r"@?([A-Za-z0-9_]{3,32})", text):
+        lw = w.lower()
+        if lw in _STOPWORDS or lw in ("toji", "tojii", "tojiii") or lw in out:
+            continue
+        out.append(lw)
+    return out[:10]
+
+
+async def _member_context(chat_id: int, asker_id: int, text: str) -> str:
+    """What the bot knows about the group members named in this message (+ recent group chat for recall questions)."""
+    parts: List[str] = []
+    tokens = _name_tokens(text)
+    members = [m for m in await profiledb.find_members(chat_id, tokens, 3) if m.get("user_id") != asker_id] if tokens else []
+    for m in members[:3]:
+        uid = m.get("user_id")
+        bits: List[str] = []
+        active = max([t for t in (_aware(m.get("last_active_at")), _aware(m.get("last_seen_at"))) if t], default=None)
+        if active:
+            bits.append(f"last message in the group {_ago_text(active)} ago")
+        note, left_at = m.get("left_note"), _aware(m.get("left_at"))
+        if note and left_at:
+            line = f'{_ago_text(left_at)} ago they wrote: "{_clip(str(note), 160)}"'
+            back = _aware(m.get("back_at"))
+            line += (f" (they posted again {_ago_text(back)} ago)" if back and back > left_at
+                     else " (nothing from them since)")
+            bits.append(line)
+        facts = [f for f in (m.get("facts") or []) if isinstance(f, str)][:5]
+        if facts:
+            bits.append("known: " + "; ".join(facts))
+        loops = [x for x in (m.get("open_loops") or []) if isinstance(x, str)][:3]
+        if loops:
+            bits.append("pending: " + "; ".join(loops))
+        if uid is not None:
+            msgs = await profiledb.recent_messages(chat_id, int(uid), 4)
+            shown = [f'"{_clip(r["content"], 100)}" ({_ago_text(r["timestamp"])} ago)' for r in msgs if r.get("content")]
+            if shown:
+                bits.append("recent messages: " + " | ".join(shown))
+        if bits:
+            parts.append(f"- {m.get('name') or 'someone'}: " + "; ".join(bits))
+    out = ""
+    if parts:
+        out = ("MEMBERS OF THIS GROUP they are asking about (what you saw in this group; talk like a friend who was "
+               "around; if the notes don't answer it, say you don't know; never invent):\n" + "\n".join(parts))
+    if _RECALL_RE.search(text):
+        rows = await profiledb.search_chat_history(chat_id, _keywords(text), 6)
+        if not rows:
+            rows = await profiledb.recent_chat_messages(chat_id, 20)
+        lines = [f'{r["name"]}: "{_clip(r["content"], 110)}" ({_ago_text(r["timestamp"])} ago)'
+                 for r in reversed(rows) if r.get("content")]
+        if lines:
+            out += ("\n\n" if out else "") + "FROM THE GROUP CHAT (oldest first):\n" + "\n".join(lines[:20])
+    return out
 
 
 # ── older messages that relate to what the person just said ──
@@ -2590,6 +2718,7 @@ async def stickers_stats_cmd(_, message: Message):
 #  MESSAGE HANDLER
 # ════════════════════════════════════════════════════════════════════
 def _reply_context(message: Message, conv: Conversation) -> str:
+    """When the person quote-replies to an older message, say which one (groups and private chats)."""
     rt = message.reply_to_message
     if rt is None:
         return ""
@@ -2599,11 +2728,11 @@ def _reply_context(message: Message, conv: Conversation) -> str:
     if rt.from_user and getattr(rt.from_user, "is_self", False):
         last = conv.last_bot_text()
         if last and last.startswith(rtext[:40]):
-            return ""  # replying to the bot's latest message: already in history
-        label = "your message"
+            return ""  # replying to the bot's latest message: already the last turn
+        label = "your older message"
     else:
         label = _safe_name(rt.from_user) if rt.from_user else "someone"
-    snippet = re.sub(r"\s+", " ", rtext)[:100].replace('"', "'")
+    snippet = re.sub(r"\s+", " ", rtext)[:140].replace('"', "'")
     return f'(replying to {label}: "{snippet}")'
 
 
@@ -2700,13 +2829,14 @@ async def _process(message: Message, text_override: Optional[str] = None, via: s
     elif via == "voice":
         stored_text = f"[voice message] {text}"
     turn_text = stored_text
-    if is_group:
-        ctx = _reply_context(message, conv)
-        if ctx:
-            turn_text = f"{ctx} {stored_text}"
+    ctx = _reply_context(message, conv)
+    if ctx:
+        turn_text = f"{ctx} {stored_text}"
     conv.add("user", name, _clip(turn_text, MAX_TURN_CHARS))
 
     if not (addressed or unaddressed):
+        if is_group and via == "text" and GROUP_LOG and PERSIST_MEMORY:
+            _spawn(_observe_group_message(chat, user, name, text))  # passive memory of what everybody says
         return
 
     # ── rate limits ───────────────────────────────────────────────
@@ -2717,6 +2847,8 @@ async def _process(message: Message, text_override: Optional[str] = None, via: s
 
     # Casual joiners never queue behind a running generation
     if is_group and unaddressed and conv.lock.locked():
+        if via == "text" and GROUP_LOG and PERSIST_MEMORY:
+            _spawn(_observe_group_message(chat, user, name, text))
         return
 
     # ── debounce bursts: only the user's latest message gets answered ─
@@ -2757,6 +2889,14 @@ async def _process(message: Message, text_override: Optional[str] = None, via: s
                 raise
             except Exception:
                 log.info("old message search skipped")
+        member_block = ""
+        if is_group and via != "sticker":
+            try:
+                member_block = await _member_context(chat_id, user.id, text)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.info("member lookup skipped")
         changes = _apply_flags(profile, text) if via != "sticker" else {}
 
         # ── open threads: did they go away earlier ("sabji lekar aata hu")? did they leave again now? ──
@@ -2769,7 +2909,7 @@ async def _process(message: Message, text_override: Optional[str] = None, via: s
                 if old_at.tzinfo is None:
                     old_at = old_at.replace(tzinfo=timezone.utc)
                 away = (datetime.now(timezone.utc) - old_at).total_seconds()
-                if away >= LEFT_MIN_GAP:
+                if LEFT_MIN_GAP <= away <= LEFT_MAX_AGE:
                     returning = (str(old_note), away)
         if via != "sticker" and _DEPART_RE.search(text):
             changes["left_note"] = _clip(text, 200)
@@ -2791,6 +2931,8 @@ async def _process(message: Message, text_override: Optional[str] = None, via: s
             except Exception:
                 pass
         memory_block = _memory_block(profile, name, gap_s, old_snips)
+        if member_block:
+            memory_block = (memory_block + "\n\n" + member_block).strip()
 
         # ── human-like: take a moment to notice / read the message ─
         if HUMAN_TIMING:
@@ -2832,6 +2974,8 @@ async def _process(message: Message, text_override: Optional[str] = None, via: s
             return
 
         if reply is None:
+            if is_group and via == "text" and GROUP_LOG and PERSIST_MEMORY:
+                _spawn(_observe_group_message(chat, user, name, text))  # chose to stay quiet, still remember it
             return
         if not conv.is_latest(user.id, seq):  # user kept typing: answer the newer message instead
             _cleanup_voice(voice_path)
@@ -2871,7 +3015,7 @@ async def _process(message: Message, text_override: Optional[str] = None, via: s
         _spawn(_after_reply(pkey, profile, chat, user, name, stored_text, reply, recent_lines))
         profile["_since"] = int(profile.get("_since", 0)) + 1
         if (profile["_since"] >= MEMORY_EVERY and not profile.get("_busy")
-                and time.monotonic() - float(profile.get("_last_refresh", 0.0)) >= MEMORY_MIN_GAP):
+                and time.monotonic() - float(profile.get("_last_refresh", -1e9)) >= MEMORY_MIN_GAP):
             profile["_since"] = 0
             profile["_busy"] = True
             profile["_last_refresh"] = time.monotonic()
