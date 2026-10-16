@@ -26,7 +26,7 @@ log = logging.getLogger("AloneX.chatbot.profiles")
 
 profile_collection = database["chatbot_profiles"]
 
-_ALLOWED_FLAGS = ("gender", "flirt_off", "minor_hint", "left_note", "left_at")
+_ALLOWED_FLAGS = ("gender", "flirt_off", "minor_hint", "left_note", "left_at", "back_at")
 _indexes_ready = False
 
 
@@ -38,6 +38,12 @@ def _clip(value, limit: int) -> str:
     return str(value).strip()[:limit]
 
 
+def _first_token(name) -> str:
+    """First word of a display name, lower case, letters/digits only ("Ram Kumar" -> "ram")."""
+    parts = str(name or "").strip().split()
+    return re.sub(r"[^\w]", "", parts[0].lower())[:32] if parts else ""
+
+
 async def initialize_profile_db() -> bool:
     """Create indexes (idempotent, called lazily)."""
     global _indexes_ready
@@ -45,6 +51,8 @@ async def initialize_profile_db() -> bool:
         return True
     try:
         await profile_collection.create_index("user_id")
+        await profile_collection.create_index([("last_chat_id", 1), ("name_lc", 1)])
+        await profile_collection.create_index([("last_chat_id", 1), ("username_lc", 1)])
         _indexes_ready = True
         return True
     except asyncio.CancelledError:
@@ -78,11 +86,13 @@ async def record_exchange(
 ) -> bool:
     """Upsert the profile after a finished exchange: last_seen, message count, where the chat stopped."""
     now = _now()
-    set_fields: Dict[str, object] = {"last_seen_at": now}
+    set_fields: Dict[str, object] = {"last_seen_at": now, "last_active_at": now}
     if name:
         set_fields["name"] = _clip(name, 64)
+        set_fields["name_lc"] = _first_token(name)
     if username:
         set_fields["username"] = _clip(username, 64)
+        set_fields["username_lc"] = str(username).strip().lower()[:64]
     if chat_id is not None:
         set_fields["last_chat_id"] = int(chat_id)
     if chat_type:
@@ -231,3 +241,127 @@ async def search_history(chat_id: int, user_id: int, words: Sequence[str], limit
     except Exception as e:
         log.error("Error searching history: %s", type(e).__name__)
         return []
+
+
+# ---------------- GROUP-WIDE MEMORY ----------------
+
+async def touch_member(
+    key: str,
+    user_id: int,
+    name: Optional[str] = None,
+    username: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    chat_title: Optional[str] = None,
+) -> bool:
+    """Lightweight 'I saw this person in this group' update (no message counted as an exchange with the bot)."""
+    now = _now()
+    set_fields: Dict[str, object] = {"last_active_at": now, "last_chat_type": "group"}
+    if name:
+        set_fields["name"] = _clip(name, 64)
+        set_fields["name_lc"] = _first_token(name)
+    if username:
+        set_fields["username"] = _clip(username, 64)
+        set_fields["username_lc"] = str(username).strip().lower()[:64]
+    if chat_id is not None:
+        set_fields["last_chat_id"] = int(chat_id)
+    if chat_title:
+        set_fields["last_chat_title"] = _clip(chat_title, 64)
+    update = {
+        "$set": set_fields,
+        "$inc": {"seen_messages": 1},
+        "$setOnInsert": {"user_id": int(user_id), "first_seen_at": now, "facts": [], "summary": ""},
+    }
+    await initialize_profile_db()
+    try:
+        await profile_collection.update_one({"_id": str(key)}, update, upsert=True)
+        return True
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("Error touching member: %s", type(e).__name__)
+        return False
+
+
+async def find_members(chat_id: int, tokens: Sequence[str], limit: int = 3) -> List[dict]:
+    """People of this group whose first name or @username equals one of `tokens` (lower case)."""
+    tokens = [str(t).strip().lower() for t in tokens if str(t).strip()][:10]
+    if not tokens:
+        return []
+    query = {
+        "last_chat_id": int(chat_id),
+        "$or": [{"name_lc": {"$in": tokens}}, {"username_lc": {"$in": tokens}}],
+    }
+    try:
+        return await profile_collection.find(query).limit(int(limit)).to_list(length=int(limit))
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("Error finding members: %s", type(e).__name__)
+        return []
+
+
+async def recent_messages(chat_id: int, user_id: int, limit: int = 5) -> List[dict]:
+    """The last messages one person wrote in a chat (newest first): [{"content", "timestamp"}]."""
+    query = {"chat_id": int(chat_id), "user_id": int(user_id), "role": "user"}
+    try:
+        n = int(limit)
+        docs = await memory_collection.find(query, {"content": 1, "timestamp": 1}).sort("_id", -1).limit(n).to_list(length=n)
+        return [{"content": str(d.get("content") or ""), "timestamp": d.get("timestamp")} for d in docs]
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("Error reading recent messages: %s", type(e).__name__)
+        return []
+
+
+async def recent_chat_messages(chat_id: int, limit: int = 25) -> List[dict]:
+    """The last messages of everybody in a chat (newest first): [{"name", "content", "timestamp"}]."""
+    query = {"chat_id": int(chat_id), "role": "user"}
+    try:
+        n = int(limit)
+        docs = await memory_collection.find(query, {"content": 1, "timestamp": 1, "user_name": 1}).sort("_id", -1).limit(n).to_list(length=n)
+        return [{"name": str(d.get("user_name") or "someone"), "content": str(d.get("content") or ""),
+                 "timestamp": d.get("timestamp")} for d in docs]
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("Error reading chat messages: %s", type(e).__name__)
+        return []
+
+
+async def search_chat_history(chat_id: int, words: Sequence[str], limit: int = 6) -> List[dict]:
+    """Messages of anybody in this chat that mention any of `words` (newest first)."""
+    words = [w for w in (str(x).strip() for x in words) if len(w) >= 3][:4]
+    if not words:
+        return []
+    query = {
+        "chat_id": int(chat_id),
+        "role": "user",
+        "content": {"$regex": "|".join(re.escape(w) for w in words), "$options": "i"},
+    }
+    try:
+        n = int(limit)
+        docs = await memory_collection.find(query, {"content": 1, "timestamp": 1, "user_name": 1}).sort("_id", -1).limit(n).to_list(length=n)
+        return [{"name": str(d.get("user_name") or "someone"), "content": str(d.get("content") or ""),
+                 "timestamp": d.get("timestamp")} for d in docs]
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("Error searching chat history: %s", type(e).__name__)
+        return []
+
+
+async def prune_chat_log(chat_id: int, keep: int = 5000) -> int:
+    """Keep only the newest `keep` stored messages of a whole chat."""
+    query = {"chat_id": int(chat_id)}
+    try:
+        docs = await memory_collection.find(query, {"_id": 1}).sort("_id", -1).skip(int(keep)).limit(1).to_list(length=1)
+        if not docs:
+            return 0
+        res = await memory_collection.delete_many({**query, "_id": {"$lte": docs[0]["_id"]}})
+        return res.deleted_count
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        log.error("Error pruning chat log: %s", type(e).__name__)
+        return 0
